@@ -28,6 +28,7 @@ static struct list all_list;
 static struct thread* idle_thread;
 static struct thread* initial_thread;
 static struct lock tid_lock;
+static uint8_t initial_fpu_state[108];
 
 struct kernel_thread_frame {
   void* eip;
@@ -97,6 +98,15 @@ void thread_start(void) {
   struct semaphore idle_started;
   sema_init(&idle_started, 0);
   thread_create("idle", PRI_MIN, idle, &idle_started);
+  /* === 核心操作：生成并保存 FPU 金标准状态 === */
+  uint32_t cr0;
+  asm volatile ("movl %%cr0, %0" : "=r" (cr0));
+  cr0 &= ~0x0C; /* 清除 EM 和 TS，解锁 FPU */
+  asm volatile ("movl %0, %%cr0" :: "r" (cr0));
+  
+  asm volatile ("fninit"); /* 初始化硬件 FPU */
+  asm volatile ("fsave %0" : "=m" (initial_fpu_state)); /* 将干净状态保存到全局变量 */
+  /* =========================================== */
   intr_enable();
   sema_down(&idle_started);
 }
@@ -292,6 +302,12 @@ static void idle(void* idle_started_ UNUSED) {
 
 static void kernel_thread(thread_func* function, void* aux) {
   ASSERT(function != NULL);
+  /* === 3. 核心修复：新线程启动时加载干净 FPU 状态 === */
+  /* 确保 CPU 寄存器是空的，不会触发 Stack Overflow */
+  asm volatile ("clts"); /* 确保 FPU 解锁 */
+  asm volatile ("frstor %0" : : "m" (running_thread()->fpu_state));
+  /* ================================================= */
+  /* =========================================== */
   intr_enable(); 
   function(aux); 
   thread_exit(); 
@@ -337,6 +353,10 @@ static void init_thread(struct thread* t, const char* name, int priority) {
 #ifdef USERPROG
   t->pcb = NULL;
 #endif
+/* === 核心修复：直接复制金标准状态 === */
+  /* 这比 memset 安全，比 asm 稳定 */
+  memcpy(t->fpu_state, initial_fpu_state, sizeof(t->fpu_state));
+  /* ================================= */
   t->magic = THREAD_MAGIC;
   old_level = intr_disable();
   list_push_back(&all_list, &t->allelem);
@@ -399,7 +419,18 @@ static void schedule(void) {
   ASSERT(cur->status != THREAD_RUNNING);
   ASSERT(is_thread(next));
   if (cur != next)
+  /* 1. 保存当前 FPU */
+      /* 为了防止 cur 根本没用过 FPU (导致 fninit 没执行过)，
+         我们可以先 fninit 一下再 fsave (为了安全)，或者直接 fsave。
+         但在 Pintos 里，最稳妥的是：如果 CR0 显示 FPU 开启了，就保存。
+         不过简化版直接 fsave 也可以，因为我们有 exception.c 兜底。*/
+      asm volatile ("clts");
+      asm volatile ("fsave %0" : "=m" (cur->fpu_state));
     prev = switch_threads(cur, next);
+    /* 2. 恢复新线程 FPU */
+    asm volatile ("clts");
+      struct thread *my_thread = running_thread ();
+      asm volatile ("frstor %0" : : "m" (my_thread->fpu_state));
   thread_switch_tail(prev);
 }
 
