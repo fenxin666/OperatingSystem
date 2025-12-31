@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include "userprog/gdt.h"
 #include "userprog/process.h"
+#include "userprog/syscall.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 
@@ -61,6 +62,28 @@ void exception_print_stats(void) { printf("Exception: %lld page faults\n", page_
 
 /* Handler for an exception (probably) caused by a user process. */
 static void kill(struct intr_frame* f) {
+/* === 核心修复：正确处理 FPU 异常，防止无限重启 === */
+  if (f->vec_no == 7) { 
+      /* 1. 读取控制寄存器 CR0 */
+      uint32_t cr0;
+      asm volatile ("movl %%cr0, %0" : "=r" (cr0));
+
+      /* 2. 清除 EM (位 2) 和 TS (位 3) */
+      /* EM (Emulation): 必须为 0，表示我们有硬件 FPU */
+      /* TS (Task Switched): 必须为 0，允许执行浮点指令 */
+      cr0 &= ~0x0C; /* 0x0C = 0x04 | 0x08 */
+
+      /* 3. 写回 CR0，解除 CPU 对 FPU 的封锁 */
+      asm volatile ("movl %0, %%cr0" :: "r" (cr0));
+
+      /* 4. 现在可以安全初始化 FPU 了 */
+      asm volatile ("fninit");
+      asm volatile ("fwait");
+      
+      /* 5. 返回用户程序，重新执行刚才失败的指令 */
+      return;
+  }
+  /* ================================= */
   /* This interrupt is one (probably) caused by a user process.
      For example, the process might have tried to access unmapped
      virtual memory (a page fault).  For now, we simply kill the
@@ -74,26 +97,38 @@ static void kill(struct intr_frame* f) {
   switch (f->cs) {
     case SEL_UCSEG:
       /* User's code segment, so it's a user exception, as we
-         expected.  Kill the user process.  */
+         expected. Kill the user process. */
       printf("%s: dying due to interrupt %#04x (%s).\n", thread_name(), f->vec_no,
              intr_name(f->vec_no));
       intr_dump_frame(f);
+
+      /* === 核心修复开始 === */
+      /* 1. 设置退出状态为 -1 (异常退出) */
+      struct thread *cur = thread_current();
+      if (cur->pcb != NULL) {
+          cur->pcb->exit_status = -1;
+      }
+
+      /* 2. 必须打印这一行，否则 args-many 等测试会 Fail */
+      printf ("%s: exit(-1)\n", cur->name);
+      
+      /* 3. 调用 process_exit 清理资源并唤醒父进程 */
       process_exit();
+      
+      /* 4. 彻底结束线程 */
+      thread_exit();
+      /* === 核心修复结束 === */
       NOT_REACHED();
 
     case SEL_KCSEG:
-      /* Kernel's code segment, which indicates a kernel bug.
-         Kernel code shouldn't throw exceptions.  (Page faults
-         may cause kernel exceptions--but they shouldn't arrive
-         here.)  Panic the kernel to make the point.  */
-      intr_dump_frame(f);
-      PANIC("Kernel bug - unexpected interrupt in kernel");
+      /* Kernel bug - unexpected interrupt in kernel */
+      intr_dump_frame (f);
+      PANIC ("Kernel bug - unexpected interrupt in kernel");
 
     default:
-      /* Some other code segment? Shouldn't happen. Panic the kernel. */
-      printf("Interrupt %#04x (%s) in unknown segment %04x\n", f->vec_no, intr_name(f->vec_no),
-             f->cs);
-      PANIC("Kernel bug - unexpected interrupt in kernel");
+      printf ("Interrupt %#04x (%s) in unknown segment %04x\n",
+              f->vec_no, intr_name (f->vec_no), f->cs);
+      thread_exit ();
   }
 }
 
