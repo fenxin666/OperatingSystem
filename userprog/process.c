@@ -78,7 +78,7 @@ struct start_aux {
 };
 
 static thread_func start_process NO_RETURN;
-static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static bool load (const char *cmdline, void (**eip) (void), void **esp, struct file **save_file);
 
 /* Forward declarations */
 static bool validate_segment (const struct Elf32_Phdr *, struct file *);
@@ -89,13 +89,10 @@ static bool setup_stack (void **esp);
 static bool install_page (void *upage, void *kpage, bool writable);
 
 /* 参数压栈函数 */
+/* 核心修复：16字节对齐的参数入栈函数 */
 void push_argument_stack(char **argv, int argc, void **esp) {
-    ASSERT(argv != NULL);
-    ASSERT(argc >= 0);
-    ASSERT(esp != NULL);
-
     char *sp = (char *)(*esp);
-    char *arg_addrs[128];
+    char *arg_addrs[128]; 
 
     /* 1. 压入参数字符串 */
     for (int i = argc - 1; i >= 0; i--) {
@@ -105,36 +102,55 @@ void push_argument_stack(char **argv, int argc, void **esp) {
         arg_addrs[i] = sp;
     }
 
-    /* 2. 栈指针对齐 */
-    while ((uintptr_t)sp % 4 != 0) {
-        sp--;
-        *sp = 0;
-    }
+    /* 2. 计算对其所需的 Padding */
+    int meta_size = (argc + 4) * 4;
+    uintptr_t current_sp = (uintptr_t)sp;
+    
+    /* 关键修改：我们要让 final_sp % 16 == 12 (0xC) */
+    /* 所以 target_sp 应该是 (current_sp - meta_size) 往下找最近的一个 结尾为 0xC 的地址 */
+    
+    /* 先找到最近的 16 字节对齐地址 */
+    uintptr_t rounded_sp = (current_sp - meta_size) & ~0xF;
+    
+    /* 然后减去 4，使其变为 ...C */
+    uintptr_t target_sp = rounded_sp - 4;
+    
+    /* 如果减去 4 后反而比 (current_sp - meta_size) 大了（这在无符号数溢出时才可能，但为了逻辑严密），
+       或者我们希望保持紧凑，这通常是安全的。
+       但在某些边界情况下，如果 rounded_sp - 4 > current_sp - meta_size，我们需要再减 16。
+       不过由于 rounded_sp 是向下取整的，rounded_sp <= current_sp - meta_size。
+       所以 rounded_sp - 4 肯定更小，一定是安全的。*/
+    
+    int padding = current_sp - (target_sp + meta_size);
+    
+    /* 3. 压入 Padding */
+    sp -= padding;
+    memset(sp, 0, padding);
 
-    /* 3. 压入 NULL (argv[argc]) */
+    /* 4. 压入 argv[argc] (NULL) */
     sp -= 4;
     *(char **)sp = NULL;
 
-    /* 4. 压入参数指针 */
+    /* 5. 压入 argv 指针 */
     for (int i = argc - 1; i >= 0; i--) {
         sp -= 4;
         *(char **)sp = arg_addrs[i];
     }
 
-    /* 5. 压入 argv */
+    /* 6. 压入 argv (char **) */
     char *argv_base = sp;
     sp -= 4;
     *(char **)sp = argv_base;
 
-    /* 6. 压入 argc */
+    /* 7. 压入 argc */
     sp -= 4;
     *(int *)sp = argc;
 
-    /* 7. 压入返回地址 */
+    /* 8. 压入 Fake Return Address */
     sp -= 4;
     *(void **)sp = NULL;
 
-    *esp = (void *)sp;
+    *esp = sp;
 }
 
 /* 初始化主线程 PCB */
@@ -258,18 +274,21 @@ static void start_process (void *aux_) {
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
   
-  success = load (argv[0], &if_.eip, &if_.esp);
+  /* === 修改开始: 接收打开的文件 === */
+  struct file *executable_file = NULL;
+  success = load (argv[0], &if_.eip, &if_.esp, &executable_file);
   pcb->load_success = success;
 
   if (success) {
-      lock_acquire(&filesys_lock);
-      struct file *exec_file = filesys_open(argv[0]);
-      if (exec_file) {
-          file_deny_write(exec_file);
-          pcb->executable = exec_file;
+      /* 文件已经在 load 中打开，不需要再次 filesys_open */
+      if (executable_file) {
+          lock_acquire(&filesys_lock);
+          file_deny_write(executable_file); /* 立即禁止写入 */
+          lock_release(&filesys_lock);
+          pcb->executable = executable_file;
       }
-      lock_release(&filesys_lock);
   }
+  /* === 修改结束 === */
 
   sema_up(&pcb->load_sema);
 
@@ -319,7 +338,9 @@ void process_exit (void) {
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  /* === 步骤 1：清理文件资源 === */
   if (cur->pcb != NULL) {
+      // 1.1 关闭所有打开的文件
       while (!list_empty(&cur->pcb->file_descriptors)) {
           struct list_elem *e = list_pop_front(&cur->pcb->file_descriptors);
           struct file_desc *fd_struct = list_entry(e, struct file_desc, elem);
@@ -329,25 +350,38 @@ void process_exit (void) {
           free(fd_struct);
       }
       
+      // 1.2 关闭自身可执行文件
       if (cur->pcb->executable) {
           lock_acquire(&filesys_lock);
           file_close(cur->pcb->executable);
           lock_release(&filesys_lock);
       }
+  }
 
+  /* === 步骤 2：安全地销毁页表 === */
+  pd = NULL;
+  if (cur->pcb != NULL) {
+      pd = cur->pcb->pagedir;   // 先把页表指针存到局部变量 pd
+      cur->pcb->pagedir = NULL; // 将 PCB 里的指针置空，防止后续误用
+  }
+  
+  // 切换回内核页目录（必须在销毁当前页目录前做）
+  pagedir_activate (NULL);
+
+  // 真正销毁页目录内存
+  if (pd != NULL) {
+      pagedir_destroy (pd);
+  }
+
+  /* === 步骤 3：最后一步唤醒父进程 === */
+  /* ⚠️ 警告：一旦执行 sema_up，父进程可能会立即释放 cur->pcb 的内存。
+     所以这行代码之后，绝对不能再访问 cur->pcb 的任何成员！ 
+     这就为什么它必须是最后一步。*/
+  if (cur->pcb != NULL) {
+      cur->pcb->exit_status = cur->pcb->exit_status; // (可选) 确保状态写入内存
       sema_up(&cur->pcb->wait_sema);
   }
-
-  if (cur->pcb != NULL) {
-      pd = cur->pcb->pagedir;
-      if (pd != NULL) {
-          cur->pcb->pagedir = NULL;
-          pagedir_activate (NULL);
-          pagedir_destroy (pd);
-      }
-  }
 }
-
 void process_activate (void) {
   struct thread *t = thread_current ();
   if (t->pcb != NULL && t->pcb->pagedir != NULL)
@@ -357,7 +391,7 @@ void process_activate (void) {
   tss_update ();
 }
 
-static bool load (const char *file_name, void (**eip) (void), void **esp) {
+static bool load (const char *file_name, void (**eip) (void), void **esp, struct file **save_file) {
     struct thread *t = thread_current ();
     struct Elf32_Ehdr ehdr;
     struct file *file = NULL;
@@ -453,10 +487,24 @@ static bool load (const char *file_name, void (**eip) (void), void **esp) {
     success = true;
 
    done:
-    if (file) {
-        lock_acquire(&filesys_lock);
-        file_close (file);
-        lock_release(&filesys_lock);
+    /* === 关键修改 === */
+    if (success) {
+        /* 如果成功，且 save_file 不为空，则保存文件指针，不要关闭 */
+        if (save_file != NULL) {
+            *save_file = file;
+        } else {
+            /* 如果不需要保存，正常关闭 */
+            lock_acquire(&filesys_lock);
+            file_close (file);
+            lock_release(&filesys_lock);
+        }
+    } else {
+        /* 如果失败，必须关闭 */
+        if (file) {
+            lock_acquire(&filesys_lock);
+            file_close (file);
+            lock_release(&filesys_lock);
+        }
     }
     return success;
 }
