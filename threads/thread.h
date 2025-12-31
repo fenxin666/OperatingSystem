@@ -61,14 +61,15 @@ struct thread {
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
-
+    
 #ifdef USERPROG
     /* [修复] 修改为 struct process*，解决 process.c 报错 */
     struct process *pcb;                /* Process Control Block */
 #endif
-
+    uint8_t fpu_state[108];
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
+    
 };
 
 /* [Task 2] 全局负载平均值 */
